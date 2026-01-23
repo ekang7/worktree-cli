@@ -2,7 +2,7 @@ use crate::env_files::run_copy_env_hook_quiet;
 use crate::error::{Result, WorktreeError};
 use crate::hooks::HookManager;
 use crate::status::{fetch_git_status, fetch_pr_status, gh_available, GitStatus, PrStatus, StatusUpdate};
-use crate::terminal::{get_open_iterm_tab_names, TerminalManager};
+use crate::terminal::{close_iterm_tab_for_worktree, get_open_iterm_tab_names, TerminalManager};
 use crate::worktree::{Worktree, WorktreeManager};
 use crossterm::{
     cursor::Show,
@@ -20,8 +20,15 @@ use ratatui::{
 };
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Update message for background tab refresh
+enum TabUpdate {
+    TabNames(Vec<String>),
+}
 
 enum AppMode {
     List,
@@ -47,6 +54,10 @@ pub struct App {
     status_tx: mpsc::Sender<StatusUpdate>,
     // Open tab tracking
     open_tabs: Vec<bool>,
+    // Background tab refresh (Fix 1)
+    tab_update_rx: Option<Receiver<TabUpdate>>,
+    tab_update_tx: Sender<TabUpdate>,
+    tab_refresh_in_progress: bool,
     // Create mode fields
     branch_name: String,
     available_branches: Vec<String>,
@@ -54,6 +65,8 @@ pub struct App {
     default_branch_idx: usize,
     cursor_position: usize,
     active_field: CreateField,
+    // Cached branch name chars (Fix 4)
+    branch_name_chars: Vec<char>,
     // Delete mode fields
     delete_worktree_idx: Option<usize>,
     delete_force: bool,
@@ -61,9 +74,12 @@ pub struct App {
     repo_root: PathBuf,
     // UI state
     needs_clear: bool,
+    needs_redraw: bool, // Fix 2: dirty flag
     // Time tracking for periodic refreshes
     last_tabs_refresh: Instant,
     last_status_refresh: Instant,
+    // Bounded thread pool (Fix 3)
+    active_fetchers: Arc<AtomicUsize>,
     // Claude Code options
     skip_permissions: bool,
 }
@@ -99,15 +115,28 @@ impl App {
         // Set up channel for status updates
         let (tx, rx) = mpsc::channel();
 
+        // Set up channel for background tab updates (Fix 1)
+        let (tab_tx, tab_rx) = mpsc::channel();
+
+        // Active fetchers counter (Fix 3)
+        let active_fetchers = Arc::new(AtomicUsize::new(0));
+
         // Check gh availability once before spawning threads
         let gh_ok = gh_available();
 
-        // Spawn one thread per worktree for parallel status fetching
+        // Spawn initial status fetchers with bounded pool (Fix 3)
+        let max_fetchers = 4;
         for (index, wt) in worktrees.iter().enumerate() {
+            if active_fetchers.load(Ordering::SeqCst) >= max_fetchers {
+                break;
+            }
+            active_fetchers.fetch_add(1, Ordering::SeqCst);
+
             let tx = tx.clone();
             let path = wt.path.clone();
             let branch = wt.branch.clone();
             let repo_root_for_thread = repo_root.clone();
+            let fetchers = active_fetchers.clone();
 
             std::thread::spawn(move || {
                 // Fetch git status
@@ -121,6 +150,8 @@ impl App {
                         let _ = tx.send(StatusUpdate::PrStatus { index, status });
                     }
                 }
+
+                fetchers.fetch_sub(1, Ordering::SeqCst);
             });
         }
 
@@ -134,32 +165,47 @@ impl App {
             status_rx: Some(rx),
             status_tx: tx,
             open_tabs,
+            tab_update_rx: Some(tab_rx),
+            tab_update_tx: tab_tx,
+            tab_refresh_in_progress: false,
             branch_name: String::new(),
             available_branches,
             selected_branch_idx: default_branch_idx,
             default_branch_idx,
             cursor_position: 0,
             active_field: CreateField::BranchName,
+            branch_name_chars: Vec::new(),
             delete_worktree_idx: None,
             delete_force: false,
             repo_root,
             needs_clear: false,
+            needs_redraw: true, // Start with redraw needed
             last_tabs_refresh: Instant::now(),
             last_status_refresh: Instant::now(),
+            active_fetchers,
             skip_permissions,
         }
     }
 
     /// Spawn background threads to fetch git and PR statuses for all worktrees
+    /// Fix 3: Bounded to max 4 concurrent threads
     fn spawn_status_fetchers(&mut self) {
         self.last_status_refresh = Instant::now();
         let gh_ok = gh_available();
+        let max_fetchers = 4;
 
         for (index, wt) in self.worktrees.iter().enumerate() {
+            // Skip if at thread limit (catches up next cycle)
+            if self.active_fetchers.load(Ordering::SeqCst) >= max_fetchers {
+                break;
+            }
+            self.active_fetchers.fetch_add(1, Ordering::SeqCst);
+
             let tx = self.status_tx.clone();
             let path = wt.path.clone();
             let branch = wt.branch.clone();
             let repo_root = self.repo_root.clone();
+            let fetchers = self.active_fetchers.clone();
 
             std::thread::spawn(move || {
                 if let Ok(status) = fetch_git_status(&path) {
@@ -171,6 +217,8 @@ impl App {
                         let _ = tx.send(StatusUpdate::PrStatus { index, status });
                     }
                 }
+
+                fetchers.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -210,27 +258,54 @@ impl App {
 
     /// Poll for status updates from background thread
     fn poll_status_updates(&mut self) {
+        // Collect status updates first to avoid borrow issues
+        let mut status_updates = Vec::new();
         if let Some(ref rx) = self.status_rx {
-            // Drain all available updates
             while let Ok(update) = rx.try_recv() {
-                match update {
-                    StatusUpdate::GitStatus { index, status } => {
-                        if index < self.git_statuses.len() {
-                            self.git_statuses[index] = Some(status);
-                        }
+                status_updates.push(update);
+            }
+        }
+
+        // Now process collected updates
+        for update in status_updates {
+            match update {
+                StatusUpdate::GitStatus { index, status } => {
+                    if index < self.git_statuses.len() {
+                        self.git_statuses[index] = Some(status);
+                        self.mark_dirty(); // Fix 2
                     }
-                    StatusUpdate::PrStatus { index, status } => {
-                        if index < self.pr_statuses.len() {
-                            self.pr_statuses[index] = status;
-                        }
+                }
+                StatusUpdate::PrStatus { index, status } => {
+                    if index < self.pr_statuses.len() {
+                        self.pr_statuses[index] = status;
+                        self.mark_dirty(); // Fix 2
                     }
                 }
             }
         }
 
-        // Refresh open tabs periodically (every 2 seconds)
-        if self.last_tabs_refresh.elapsed() > Duration::from_secs(2) {
-            self.refresh_open_tabs();
+        // Collect tab updates first to avoid borrow issues (Fix 1)
+        let mut tab_updates = Vec::new();
+        if let Some(ref rx) = self.tab_update_rx {
+            while let Ok(update) = rx.try_recv() {
+                tab_updates.push(update);
+            }
+        }
+
+        // Now process collected tab updates
+        for update in tab_updates {
+            match update {
+                TabUpdate::TabNames(names) => {
+                    self.update_open_tabs_from_names(&names);
+                    self.tab_refresh_in_progress = false;
+                    self.mark_dirty(); // Fix 2
+                }
+            }
+        }
+
+        // Trigger background tab refresh periodically (every 2 seconds) - Fix 1
+        if self.last_tabs_refresh.elapsed() > Duration::from_secs(2) && !self.tab_refresh_in_progress {
+            self.trigger_tab_refresh();
         }
 
         // Refresh git/PR statuses periodically (every 5 seconds)
@@ -239,9 +314,28 @@ impl App {
         }
     }
 
-    /// Refresh open tabs tracking
+    /// Refresh open tabs tracking (blocking - used for immediate refresh after actions)
     fn refresh_open_tabs(&mut self) {
         let open_tab_names = get_open_iterm_tab_names();
+        self.update_open_tabs_from_names(&open_tab_names);
+        self.last_tabs_refresh = Instant::now();
+        self.mark_dirty();
+    }
+
+    /// Fix 1: Trigger background tab refresh (non-blocking)
+    fn trigger_tab_refresh(&mut self) {
+        self.tab_refresh_in_progress = true;
+        self.last_tabs_refresh = Instant::now();
+
+        let tx = self.tab_update_tx.clone();
+        std::thread::spawn(move || {
+            let names = get_open_iterm_tab_names();
+            let _ = tx.send(TabUpdate::TabNames(names));
+        });
+    }
+
+    /// Fix 1: Update open tabs from pre-fetched names
+    fn update_open_tabs_from_names(&mut self, open_tab_names: &[String]) {
         self.open_tabs = self
             .worktrees
             .iter()
@@ -251,7 +345,21 @@ impl App {
                 open_tab_names.iter().any(|name| name.contains(&expected_name))
             })
             .collect();
-        self.last_tabs_refresh = Instant::now();
+    }
+
+    /// Fix 2: Mark that a redraw is needed
+    fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Fix 4: Sync the cached char vec with branch_name
+    fn sync_branch_name_chars(&mut self) {
+        self.branch_name_chars = self.branch_name.chars().collect();
+    }
+
+    /// Fix 4: Get character at position using cached vec (O(1) instead of O(n))
+    fn char_at(&self, pos: usize) -> Option<char> {
+        self.branch_name_chars.get(pos).copied()
     }
 
     /// Open terminal for the selected worktree
@@ -269,8 +377,8 @@ impl App {
         let branch_name = self.branch_name.clone();
         let base_branch = self.get_selected_base_branch().to_string();
 
-        // Create the worktree
-        match manager.create_worktree(&branch_name, &base_branch, None, true) {
+        // Create the worktree (quiet mode to avoid TUI pollution)
+        match manager.create_worktree_quiet(&branch_name, &base_branch, None, true) {
             Ok(worktree_path) => {
                 // Run hooks (quiet mode to avoid TUI pollution)
                 let hook_manager = HookManager::new(&self.repo_root);
@@ -291,6 +399,7 @@ impl App {
 
         // Clear input and return to list mode
         self.branch_name.clear();
+        self.branch_name_chars.clear(); // Fix 4
         self.cursor_position = 0;
         self.mode = AppMode::List;
     }
@@ -313,9 +422,11 @@ impl App {
             KeyCode::Char('n') => {
                 self.mode = AppMode::CreateNew;
                 self.branch_name.clear();
+                self.branch_name_chars.clear(); // Fix 4
                 self.selected_branch_idx = self.default_branch_idx;
                 self.cursor_position = 0;
                 self.active_field = CreateField::BranchName;
+                self.mark_dirty();
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(selected) = self.list_state.selected() {
@@ -323,23 +434,28 @@ impl App {
                     if !self.worktrees[selected].is_bare {
                         self.delete_worktree_idx = Some(selected);
                         self.mode = AppMode::ConfirmDelete;
+                        self.mark_dirty();
                     }
                 }
             }
             KeyCode::Char('s') => {
                 if self.list_state.selected().is_some() {
                     self.mode = AppMode::StatusDetail;
+                    self.mark_dirty();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_next();
+                self.mark_dirty();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_previous();
+                self.mark_dirty();
             }
             KeyCode::Enter => {
                 if let Some(selected) = self.list_state.selected() {
                     self.open_terminal_for_worktree(selected);
+                    self.mark_dirty();
                 }
             }
             _ => {}
@@ -351,20 +467,24 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => {
                 // Confirmed deletion (normal)
                 self.perform_deletion(manager, false);
+                self.mark_dirty();
             }
             KeyCode::Char('f') => {
                 // Force deletion
                 self.perform_deletion(manager, true);
+                self.mark_dirty();
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.delete_worktree_idx = None;
                 self.delete_force = false;
                 self.mode = AppMode::List;
+                self.mark_dirty();
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_worktree_idx = None;
                 self.delete_force = false;
                 self.mode = AppMode::List;
+                self.mark_dirty();
             }
             _ => {}
         }
@@ -381,8 +501,11 @@ impl App {
             let hook_manager = HookManager::new(&self.repo_root);
             let _ = hook_manager.run_hooks_quiet("pre-remove", &path, &branch);
 
-            // Attempt to remove the worktree
-            if manager.remove_worktree(&path, force).is_ok() {
+            // Attempt to remove the worktree (quiet mode to avoid TUI pollution)
+            if manager.remove_worktree_quiet(&path, force).is_ok() {
+                // Close the associated iTerm2 tab (if open)
+                close_iterm_tab_for_worktree(&path, &branch);
+
                 // Refresh the worktree list
                 self.refresh_worktrees(manager);
             }
@@ -399,9 +522,11 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Enter => {
                 self.mode = AppMode::List;
+                self.mark_dirty();
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.mode = AppMode::List;
+                self.mark_dirty();
             }
             _ => {}
         }
@@ -413,27 +538,33 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.mode = AppMode::List;
+                    self.mark_dirty();
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.mode = AppMode::List;
+                    self.mark_dirty();
                 }
                 KeyCode::Tab => {
                     self.active_field = CreateField::BranchName;
                     self.update_cursor_position();
+                    self.mark_dirty();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.selected_branch_idx > 0 {
                         self.selected_branch_idx -= 1;
+                        self.mark_dirty();
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.selected_branch_idx < self.available_branches.len().saturating_sub(1) {
                         self.selected_branch_idx += 1;
+                        self.mark_dirty();
                     }
                 }
                 KeyCode::Enter => {
                     if !self.branch_name.is_empty() {
                         self.create_and_open_worktree(manager);
+                        self.mark_dirty();
                     }
                 }
                 _ => {}
@@ -447,24 +578,30 @@ impl App {
             match key.code {
                 KeyCode::Char('c') => {
                     self.mode = AppMode::List;
+                    self.mark_dirty();
                     return;
                 }
                 KeyCode::Char('a') => {
                     self.cursor_position = 0;
+                    self.mark_dirty();
                     return;
                 }
                 KeyCode::Char('e') => {
-                    let len = self.branch_name.len();
+                    let len = self.branch_name_chars.len(); // Fix 4
                     self.cursor_position = len;
+                    self.mark_dirty();
                     return;
                 }
                 KeyCode::Char('w') => {
                     self.delete_word_backward();
+                    self.mark_dirty();
                     return;
                 }
                 KeyCode::Char('k') => {
                     let pos = self.cursor_position;
                     self.branch_name.truncate(pos);
+                    self.sync_branch_name_chars(); // Fix 4
+                    self.mark_dirty();
                     return;
                 }
                 _ => {}
@@ -475,10 +612,12 @@ impl App {
             match key.code {
                 KeyCode::Left => {
                     self.move_cursor_left_word();
+                    self.mark_dirty();
                     return;
                 }
                 KeyCode::Right => {
                     self.move_cursor_right_word();
+                    self.mark_dirty();
                     return;
                 }
                 _ => {}
@@ -489,51 +628,64 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::List;
+                self.mark_dirty();
             }
             KeyCode::Tab => {
                 self.active_field = CreateField::BaseBranch;
+                self.mark_dirty();
             }
             KeyCode::Enter => {
                 if !self.branch_name.is_empty() {
                     self.create_and_open_worktree(manager);
+                    self.mark_dirty();
                 }
             }
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
                     let pos = self.cursor_position;
                     self.branch_name.remove(pos - 1);
+                    self.branch_name_chars.remove(pos - 1); // Fix 4
                     self.cursor_position -= 1;
+                    self.mark_dirty();
                 }
             }
             KeyCode::Delete => {
                 let pos = self.cursor_position;
-                let len = self.branch_name.len();
+                let len = self.branch_name_chars.len(); // Fix 4
                 if pos < len {
                     self.branch_name.remove(pos);
+                    self.branch_name_chars.remove(pos); // Fix 4
+                    self.mark_dirty();
                 }
             }
             KeyCode::Left => {
                 if self.cursor_position > 0 {
                     self.cursor_position -= 1;
+                    self.mark_dirty();
                 }
             }
             KeyCode::Right => {
-                let text_len = self.branch_name.len();
+                let text_len = self.branch_name_chars.len(); // Fix 4
                 if self.cursor_position < text_len {
                     self.cursor_position += 1;
+                    self.mark_dirty();
                 }
             }
             KeyCode::Home => {
                 self.cursor_position = 0;
+                self.mark_dirty();
             }
             KeyCode::End => {
-                let len = self.branch_name.len();
+                let len = self.branch_name_chars.len(); // Fix 4
                 self.cursor_position = len;
+                self.mark_dirty();
             }
             KeyCode::Char(c) => {
                 let pos = self.cursor_position;
                 self.branch_name.insert(pos, c);
+                self.branch_name_chars.insert(pos, c); // Fix 4
                 self.cursor_position += 1;
+                self.mark_dirty();
             }
             _ => {}
         }
@@ -543,6 +695,7 @@ impl App {
         self.cursor_position = self.branch_name.len();
     }
 
+    /// Fix 4: Use cached char vec for O(1) character access
     fn move_cursor_left_word(&mut self) {
         if self.cursor_position == 0 {
             return;
@@ -550,34 +703,36 @@ impl App {
 
         let mut pos = self.cursor_position - 1;
         // Skip whitespace
-        while pos > 0 && self.branch_name.chars().nth(pos).unwrap().is_whitespace() {
+        while pos > 0 && self.char_at(pos).map_or(false, |c| c.is_whitespace()) {
             pos -= 1;
         }
         // Skip word characters
-        while pos > 0 && !self.branch_name.chars().nth(pos - 1).unwrap().is_whitespace() {
+        while pos > 0 && self.char_at(pos - 1).map_or(false, |c| !c.is_whitespace()) {
             pos -= 1;
         }
         self.cursor_position = pos;
     }
 
+    /// Fix 4: Use cached char vec for O(1) character access
     fn move_cursor_right_word(&mut self) {
-        let len = self.branch_name.len();
+        let len = self.branch_name_chars.len();
         if self.cursor_position >= len {
             return;
         }
 
         let mut pos = self.cursor_position;
         // Skip word characters
-        while pos < len && !self.branch_name.chars().nth(pos).unwrap().is_whitespace() {
+        while pos < len && self.char_at(pos).map_or(false, |c| !c.is_whitespace()) {
             pos += 1;
         }
         // Skip whitespace
-        while pos < len && self.branch_name.chars().nth(pos).unwrap().is_whitespace() {
+        while pos < len && self.char_at(pos).map_or(false, |c| c.is_whitespace()) {
             pos += 1;
         }
         self.cursor_position = pos;
     }
 
+    /// Fix 4: Use cached char vec for O(1) character access
     fn delete_word_backward(&mut self) {
         if self.cursor_position == 0 {
             return;
@@ -588,16 +743,17 @@ impl App {
         let mut pos = self.cursor_position - 1;
 
         // Skip whitespace
-        while pos > 0 && self.branch_name.chars().nth(pos).unwrap().is_whitespace() {
+        while pos > 0 && self.char_at(pos).map_or(false, |c| c.is_whitespace()) {
             pos -= 1;
         }
         // Skip word characters
-        while pos > 0 && !self.branch_name.chars().nth(pos - 1).unwrap().is_whitespace() {
+        while pos > 0 && self.char_at(pos - 1).map_or(false, |c| !c.is_whitespace()) {
             pos -= 1;
         }
 
-        // Now mutate
+        // Now mutate both string and char cache
         self.branch_name.drain(pos..original_pos);
+        self.branch_name_chars.drain(pos..original_pos);
         self.cursor_position = pos;
     }
 
@@ -1199,25 +1355,30 @@ fn run_app<B: ratatui::backend::Backend>(
         if app.needs_clear {
             terminal.clear().map_err(|e| WorktreeError::Terminal(e.to_string()))?;
             app.needs_clear = false;
+            app.needs_redraw = true;
         }
 
-        terminal
-            .draw(|frame| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(0), Constraint::Length(3)])
-                    .split(frame.size());
+        // Fix 2: Only redraw when state has changed
+        if app.needs_redraw {
+            terminal
+                .draw(|frame| {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(0), Constraint::Length(3)])
+                        .split(frame.size());
 
-                match app.mode {
-                    AppMode::List => app.render_list(frame, chunks[0]),
-                    AppMode::CreateNew => app.render_create_form(frame, chunks[0]),
-                    AppMode::ConfirmDelete => app.render_delete_confirm(frame, chunks[0]),
-                    AppMode::StatusDetail => app.render_status_detail(frame, chunks[0]),
-                }
+                    match app.mode {
+                        AppMode::List => app.render_list(frame, chunks[0]),
+                        AppMode::CreateNew => app.render_create_form(frame, chunks[0]),
+                        AppMode::ConfirmDelete => app.render_delete_confirm(frame, chunks[0]),
+                        AppMode::StatusDetail => app.render_status_detail(frame, chunks[0]),
+                    }
 
-                app.render_help(frame, chunks[1]);
-            })
-            .map_err(|e| WorktreeError::Terminal(e.to_string()))?;
+                    app.render_help(frame, chunks[1]);
+                })
+                .map_err(|e| WorktreeError::Terminal(e.to_string()))?;
+            app.needs_redraw = false;
+        }
 
         // Use poll with timeout instead of blocking read for responsiveness
         if event::poll(Duration::from_millis(100)).map_err(|e| WorktreeError::Terminal(e.to_string()))? {

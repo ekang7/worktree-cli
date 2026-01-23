@@ -475,3 +475,52 @@ end tell
         .filter(|s| !s.is_empty())
         .collect()
 }
+
+/// Close an iTerm2 tab associated with a worktree
+/// Returns true if tab was found and closed, false otherwise
+pub fn close_iterm_tab_for_worktree(worktree_path: &Path, branch: &str) -> bool {
+    let dirname = match worktree_path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    let tab_name = format!("{} - {}", dirname, branch);
+
+    let script = format!(
+        r#"
+tell application "iTerm2"
+    repeat with w in windows
+        tell w
+            repeat with t in tabs
+                tell t
+                    repeat with s in sessions
+                        if name of s contains "{tab_name}" then
+                            close t
+                            return "closed"
+                        end if
+                    end repeat
+                end tell
+            end repeat
+        end tell
+    end repeat
+end tell
+return "not_found"
+"#,
+        tab_name = tab_name
+    );
+
+    let output = match Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    String::from_utf8_lossy(&output.stdout).trim() == "closed"
+}

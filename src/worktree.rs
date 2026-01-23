@@ -230,6 +230,82 @@ impl WorktreeManager {
         Ok(worktree_path)
     }
 
+    /// Create a worktree without printing status messages (for TUI mode)
+    pub fn create_worktree_quiet(
+        &self,
+        branch_name: &str,
+        base_branch: &str,
+        custom_dir: Option<&str>,
+        new_flag: bool,
+    ) -> Result<PathBuf> {
+        // Fetch latest changes
+        self.git_fetch()?;
+
+        // Prune stale worktrees
+        self.git_prune_worktrees()?;
+
+        // Check if branch exists locally and/or remotely
+        let local_exists = self.local_branch_exists(branch_name)?;
+        let remote_exists = self.remote_branch_exists(branch_name)?;
+
+        if new_flag && (local_exists || remote_exists) {
+            return Err(WorktreeError::AlreadyExists(format!(
+                "Branch '{}' already exists. Use without --new flag to switch to existing worktree.",
+                branch_name
+            )));
+        }
+
+        // Determine worktree directory
+        let default_dir_name = format!("{}-{}", self.project_name, branch_name);
+        let worktree_dir_name = custom_dir.unwrap_or(&default_dir_name);
+        let worktree_path = self.repo_root
+            .parent()
+            .ok_or_else(|| WorktreeError::InvalidPath("Cannot determine parent directory".to_string()))?
+            .join(worktree_dir_name);
+
+        // Check if worktree already exists at this path
+        if worktree_path.exists() {
+            return Err(WorktreeError::AlreadyExists(format!(
+                "Directory already exists: {}",
+                worktree_path.display()
+            )));
+        }
+
+        let path_str = worktree_path.to_str().unwrap();
+        let output = if local_exists {
+            Command::new("git")
+                .args(["worktree", "add", path_str, branch_name])
+                .current_dir(&self.repo_root)
+                .output()
+                .map_err(|e| WorktreeError::Git(format!("Failed to create worktree: {}", e)))?
+        } else if remote_exists {
+            Command::new("git")
+                .args(["worktree", "add", path_str, "-b", branch_name, &format!("origin/{}", branch_name)])
+                .current_dir(&self.repo_root)
+                .output()
+                .map_err(|e| WorktreeError::Git(format!("Failed to create worktree: {}", e)))?
+        } else {
+            if !self.branch_exists(base_branch)? {
+                return Err(WorktreeError::BranchNotFound(format!(
+                    "Base branch '{}' not found",
+                    base_branch
+                )));
+            }
+            Command::new("git")
+                .args(["worktree", "add", path_str, "-b", branch_name, base_branch])
+                .current_dir(&self.repo_root)
+                .output()
+                .map_err(|e| WorktreeError::Git(format!("Failed to create worktree: {}", e)))?
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!("git worktree add failed: {}", stderr)));
+        }
+
+        Ok(worktree_path)
+    }
+
     pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
         println!(
             "{}",
@@ -266,6 +342,35 @@ impl WorktreeManager {
         }
 
         println!("{}", "Worktree removed successfully!".bright_green());
+        Ok(())
+    }
+
+    /// Remove a worktree without printing status messages (for TUI mode)
+    pub fn remove_worktree_quiet(&self, path: &Path, force: bool) -> Result<()> {
+        let mut args = vec!["worktree", "remove"];
+
+        if force {
+            args.push("--force");
+        }
+
+        args.push(path.to_str().unwrap());
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.repo_root)
+            .output()
+            .map_err(|e| WorktreeError::Git(format!("Failed to remove worktree: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!("git worktree remove failed: {}", stderr)));
+        }
+
+        // Clean up the directory if it still exists
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+
         Ok(())
     }
 
