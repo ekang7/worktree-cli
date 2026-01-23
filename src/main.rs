@@ -118,12 +118,19 @@ fn handle_remove(target: Option<&str>, force: bool) -> Result<()> {
             .ok_or(worktree_cli::WorktreeError::Cancelled)?
     };
 
+    // Clone path/branch before removal since worktree is borrowed
+    let worktree_path = worktree.path.clone();
+    let worktree_branch = worktree.branch.clone();
+
     // Run pre-remove hooks
     let hook_manager = HookManager::new(manager.repo_root());
-    hook_manager.run_hooks("pre-remove", &worktree.path, &worktree.branch)?;
+    hook_manager.run_hooks("pre-remove", &worktree_path, &worktree_branch)?;
 
     // Remove the worktree
-    manager.remove_worktree(&worktree.path, force)?;
+    manager.remove_worktree(&worktree_path, force)?;
+
+    // Close the associated iTerm2 tab silently (if open)
+    worktree_cli::terminal::close_iterm_tab_for_worktree(&worktree_path, &worktree_branch);
 
     Ok(())
 }
