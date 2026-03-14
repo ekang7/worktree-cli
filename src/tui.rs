@@ -67,6 +67,9 @@ pub struct App {
     active_field: CreateField,
     // Cached branch name chars (Fix 4)
     branch_name_chars: Vec<char>,
+    // Branch filter/search
+    branch_filter: String,
+    filtered_branches: Vec<usize>,
     // Delete mode fields
     delete_worktree_idx: Option<usize>,
     delete_force: bool,
@@ -117,6 +120,9 @@ impl App {
 
         // Set up channel for background tab updates (Fix 1)
         let (tab_tx, tab_rx) = mpsc::channel();
+
+        // Initialize filtered branches to all indices
+        let filtered_branches: Vec<usize> = (0..available_branches.len()).collect();
 
         // Active fetchers counter (Fix 3)
         let active_fetchers = Arc::new(AtomicUsize::new(0));
@@ -175,6 +181,8 @@ impl App {
             cursor_position: 0,
             active_field: CreateField::BranchName,
             branch_name_chars: Vec::new(),
+            branch_filter: String::new(),
+            filtered_branches,
             delete_worktree_idx: None,
             delete_force: false,
             repo_root,
@@ -191,11 +199,25 @@ impl App {
     /// Fix 3: Bounded to max 4 concurrent threads
     fn spawn_status_fetchers(&mut self) {
         self.last_status_refresh = Instant::now();
+        // Clear statuses to force refetch of all worktrees
+        self.git_statuses = vec![None; self.worktrees.len()];
+        self.pr_statuses = vec![None; self.worktrees.len()];
+        // Spawn fetchers for worktrees (remaining ones will be picked up by poll_status_updates)
+        self.spawn_remaining_status_fetchers();
+    }
+
+    /// Spawn fetchers for worktrees that don't have status yet
+    /// Called from spawn_status_fetchers() and poll_status_updates()
+    fn spawn_remaining_status_fetchers(&mut self) {
         let gh_ok = gh_available();
         let max_fetchers = 4;
 
         for (index, wt) in self.worktrees.iter().enumerate() {
-            // Skip if at thread limit (catches up next cycle)
+            // Skip if already have git status (means this worktree was already fetched)
+            if self.git_statuses.get(index).and_then(|s| s.as_ref()).is_some() {
+                continue;
+            }
+            // Skip if at thread limit (will be picked up on next poll cycle)
             if self.active_fetchers.load(Ordering::SeqCst) >= max_fetchers {
                 break;
             }
@@ -308,10 +330,9 @@ impl App {
             self.trigger_tab_refresh();
         }
 
-        // Refresh git/PR statuses periodically (every 5 seconds)
-        if self.last_status_refresh.elapsed() > Duration::from_secs(5) {
-            self.spawn_status_fetchers();
-        }
+        // Spawn fetchers for remaining worktrees that don't have status yet
+        // This handles worktrees beyond the initial 4 when slots become available
+        self.spawn_remaining_status_fetchers();
     }
 
     /// Refresh open tabs tracking (blocking - used for immediate refresh after actions)
@@ -362,6 +383,28 @@ impl App {
         self.branch_name_chars.get(pos).copied()
     }
 
+    /// Update filtered_branches based on branch_filter text
+    fn update_filtered_branches(&mut self) {
+        let filter = self.branch_filter.to_lowercase();
+        if filter.is_empty() {
+            self.filtered_branches = (0..self.available_branches.len()).collect();
+        } else {
+            self.filtered_branches = self
+                .available_branches
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.to_lowercase().contains(&filter))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        // Clamp selection to filtered list
+        if self.filtered_branches.is_empty() {
+            self.selected_branch_idx = 0;
+        } else if self.selected_branch_idx >= self.filtered_branches.len() {
+            self.selected_branch_idx = 0;
+        }
+    }
+
     /// Open terminal for the selected worktree
     fn open_terminal_for_worktree(&mut self, index: usize) {
         if let Some(worktree) = self.worktrees.get(index) {
@@ -405,8 +448,13 @@ impl App {
     }
 
     fn get_selected_base_branch(&self) -> &str {
-        self.available_branches
+        let actual_idx = self
+            .filtered_branches
             .get(self.selected_branch_idx)
+            .copied()
+            .unwrap_or(self.default_branch_idx);
+        self.available_branches
+            .get(actual_idx)
             .map(|s| s.as_str())
             .unwrap_or("main")
     }
@@ -423,6 +471,9 @@ impl App {
                 self.mode = AppMode::CreateNew;
                 self.branch_name.clear();
                 self.branch_name_chars.clear(); // Fix 4
+                self.branch_filter.clear();
+                self.filtered_branches = (0..self.available_branches.len()).collect();
+                // default_branch_idx is into available_branches; with unfiltered list it matches
                 self.selected_branch_idx = self.default_branch_idx;
                 self.cursor_position = 0;
                 self.active_field = CreateField::BranchName;
@@ -443,6 +494,11 @@ impl App {
                     self.mode = AppMode::StatusDetail;
                     self.mark_dirty();
                 }
+            }
+            KeyCode::Char('r') => {
+                // Manual refresh of git/PR statuses
+                self.spawn_status_fetchers();
+                self.mark_dirty();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_next();
@@ -537,8 +593,15 @@ impl App {
         if matches!(self.active_field, CreateField::BaseBranch) {
             match key.code {
                 KeyCode::Esc => {
-                    self.mode = AppMode::List;
-                    self.mark_dirty();
+                    if !self.branch_filter.is_empty() {
+                        // Clear filter first
+                        self.branch_filter.clear();
+                        self.update_filtered_branches();
+                        self.mark_dirty();
+                    } else {
+                        self.mode = AppMode::List;
+                        self.mark_dirty();
+                    }
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.mode = AppMode::List;
@@ -549,14 +612,14 @@ impl App {
                     self.update_cursor_position();
                     self.mark_dirty();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if self.selected_branch_idx > 0 {
                         self.selected_branch_idx -= 1;
                         self.mark_dirty();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.selected_branch_idx < self.available_branches.len().saturating_sub(1) {
+                KeyCode::Down => {
+                    if self.selected_branch_idx < self.filtered_branches.len().saturating_sub(1) {
                         self.selected_branch_idx += 1;
                         self.mark_dirty();
                     }
@@ -566,6 +629,18 @@ impl App {
                         self.create_and_open_worktree(manager);
                         self.mark_dirty();
                     }
+                }
+                KeyCode::Backspace => {
+                    if !self.branch_filter.is_empty() {
+                        self.branch_filter.pop();
+                        self.update_filtered_branches();
+                        self.mark_dirty();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.branch_filter.push(c);
+                    self.update_filtered_branches();
+                    self.mark_dirty();
                 }
                 _ => {}
             }
@@ -934,19 +1009,39 @@ impl App {
         };
 
         let branch_items: Vec<ListItem> = self
-            .available_branches
+            .filtered_branches
             .iter()
-            .map(|branch| ListItem::new(Line::from(branch.as_str())))
+            .map(|&idx| {
+                let branch = &self.available_branches[idx];
+                ListItem::new(Line::from(branch.as_str()))
+            })
             .collect();
 
         let mut branch_list_state = ListState::default();
-        branch_list_state.select(Some(self.selected_branch_idx));
+        if !self.filtered_branches.is_empty() {
+            branch_list_state.select(Some(self.selected_branch_idx));
+        }
+
+        let title = if !self.branch_filter.is_empty() {
+            format!(
+                " Base Branch: {} ({}/{}) ",
+                self.branch_filter,
+                self.filtered_branches.len(),
+                self.available_branches.len()
+            )
+        } else {
+            format!(
+                " Base Branch (type to search, ↑/↓) [{}/{}] ",
+                self.filtered_branches.len(),
+                self.available_branches.len()
+            )
+        };
 
         let branch_list = List::new(branch_items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Base Branch (↑/↓ to select) ")
+                    .title(title)
                     .title_style(base_style)
                     .border_style(base_style),
             )
@@ -960,38 +1055,63 @@ impl App {
         frame.render_stateful_widget(branch_list, chunks[1], &mut branch_list_state.clone());
 
         // Help text
-        let help_text = Text::from(vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Tab", Style::default().fg(Color::Cyan)),
-                Span::raw(" - Switch fields"),
-            ]),
-            Line::from(vec![
-                Span::styled("Enter", Style::default().fg(Color::Cyan)),
-                Span::raw(" - Create worktree"),
-            ]),
-            Line::from(vec![
-                Span::styled("Esc", Style::default().fg(Color::Cyan)),
-                Span::raw(" - Cancel"),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
-                Span::raw(" - Go to start  "),
-                Span::styled("Ctrl+E", Style::default().fg(Color::Yellow)),
-                Span::raw(" - Go to end"),
-            ]),
-            Line::from(vec![
-                Span::styled("Alt+←/→", Style::default().fg(Color::Yellow)),
-                Span::raw(" - Move by word  "),
-                Span::styled("Ctrl+W", Style::default().fg(Color::Yellow)),
-                Span::raw(" - Delete word"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+K", Style::default().fg(Color::Yellow)),
-                Span::raw(" - Delete to end"),
-            ]),
-        ]);
+        let help_lines = if base_active {
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Type", Style::default().fg(Color::Green)),
+                    Span::raw(" to filter branches  "),
+                    Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+                    Span::raw(" Navigate  "),
+                    Span::styled("Backspace", Style::default().fg(Color::Yellow)),
+                    Span::raw(" Clear char"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Clear filter / Cancel  "),
+                    Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Switch fields"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Create worktree"),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Switch fields"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Create worktree"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Cyan)),
+                    Span::raw(" - Cancel"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Ctrl+A", Style::default().fg(Color::Yellow)),
+                    Span::raw(" - Go to start  "),
+                    Span::styled("Ctrl+E", Style::default().fg(Color::Yellow)),
+                    Span::raw(" - Go to end"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Alt+←/→", Style::default().fg(Color::Yellow)),
+                    Span::raw(" - Move by word  "),
+                    Span::styled("Ctrl+W", Style::default().fg(Color::Yellow)),
+                    Span::raw(" - Delete word"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Ctrl+K", Style::default().fg(Color::Yellow)),
+                    Span::raw(" - Delete to end"),
+                ]),
+            ]
+        };
+        let help_text = Text::from(help_lines);
 
         let help = Paragraph::new(help_text)
             .block(Block::default().borders(Borders::ALL).title(" Help "))
@@ -1245,6 +1365,8 @@ impl App {
                     Span::raw(" Select  "),
                     Span::styled("s", Style::default().fg(Color::Yellow)),
                     Span::raw(" Status  "),
+                    Span::styled("r", Style::default().fg(Color::Blue)),
+                    Span::raw(" Refresh  "),
                     Span::styled("n", Style::default().fg(Color::Green)),
                     Span::raw(" New  "),
                     Span::styled("d", Style::default().fg(Color::Red)),

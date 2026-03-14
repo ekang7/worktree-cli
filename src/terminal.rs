@@ -2,7 +2,6 @@ use crate::error::{Result, WorktreeError};
 use crate::worktree::Worktree;
 use colored::Colorize;
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -168,29 +167,7 @@ return "not_found"
         // Tab title format matches bash script: "dirname - branch" (no brackets)
         let tab_name = format!("{} - {}", dir_name, branch_name);
 
-        // Create hook script for dynamic tab title and color updates (matches bash script)
-        let hook_script = r#"__update_iterm_tab() {
-    local b=$(git symbolic-ref --short HEAD 2>/dev/null || echo "no-branch")
-    local d=$(basename "$PWD")
-    printf '\033]1;%s - %s\007' "$d" "$b"
-    # Blue color for feature branches
-    printf '\033]6;1;bg;red;brightness;60\007'
-    printf '\033]6;1;bg;green;brightness;80\007'
-    printf '\033]6;1;bg;blue;brightness;180\007'
-}
-if [[ -n "$ZSH_VERSION" ]]; then
-    precmd_functions+=(__update_iterm_tab)
-else
-    PROMPT_COMMAND="__update_iterm_tab;${PROMPT_COMMAND:+$PROMPT_COMMAND}"
-fi
-__update_iterm_tab
-"#;
-
-        let hook_path = worktree_path.join(".iterm-tab-hook.sh");
-        fs::write(&hook_path, hook_script)
-            .map_err(|e| WorktreeError::Terminal(format!("Failed to create hook script: {}", e)))?;
-
-        // AppleScript to create split panes with tab color and hook sourcing
+        // AppleScript to create split panes with tab color
         // Matches the bash script's iTerm setup
         // Note: \e]1;...\a sets tab title, \e]6;1;bg;...;\a sets tab color
         let claude_cmd = self.claude_args();
@@ -214,7 +191,7 @@ tell application "iTerm2"
             end tell
             tell last session
                 set name to "{tab_name}"
-                write text "cd '{path}' && source .iterm-tab-hook.sh"
+                write text "cd '{path}' && printf '\\033]1;{tab_name}\\007' && printf '\\033]6;1;bg;red;brightness;60\\007' && printf '\\033]6;1;bg;green;brightness;80\\007' && printf '\\033]6;1;bg;blue;brightness;180\\007'"
             end tell
         end tell
     end tell
