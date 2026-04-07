@@ -231,8 +231,8 @@ The tool respects the following environment variables:
 # 1. Initialize hooks
 worktree hooks init
 
-# 2. Create a new feature worktree
-worktree new feature-user-auth
+# 2. Create a new feature worktree with terminal panes
+worktree new feature-user-auth --terminal
 
 # 3. Work on the feature...
 
