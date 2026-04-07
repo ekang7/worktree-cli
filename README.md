@@ -54,6 +54,9 @@ worktree new feature-auth --base develop
 # Custom directory name
 worktree new feature-ui --dir my-custom-name
 
+# Open terminal with split panes (Claude Code + shell)
+worktree new feature-api --terminal
+
 # Don't launch Claude Code
 worktree new feature-x --no-launch
 
@@ -194,8 +197,8 @@ The tool automatically detects your terminal type and provides seamless integrat
 ### Usage
 
 ```bash
-# Terminal panes are the default
-worktree new feature-name
+# Use --terminal flag to enable panes/tabs
+worktree new feature-name --terminal
 ```
 
 ## Key Behaviors
