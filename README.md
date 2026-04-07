@@ -45,24 +45,26 @@ worktree list --shell-only
 ### Create New Worktree
 
 ```bash
-# Create new worktree from main branch
-worktree new feature-login --new
+# Create worktree (new branch from main, or existing branch)
+worktree new feature-login
 
 # Create from specific base branch
-worktree new feature-auth --new --base develop
+worktree new feature-auth --base develop
 
 # Custom directory name
-worktree new feature-ui --new --dir my-custom-name
-
-# Open terminal with split panes (Claude Code + shell)
-worktree new feature-api --new --terminal
+worktree new feature-ui --dir my-custom-name
 
 # Don't launch Claude Code
-worktree new feature-x --new --no-launch
+worktree new feature-x --no-launch
 
 # Skip all hooks (no .env copying, etc.)
-worktree new feature-y --new --no-hooks
+worktree new feature-y --no-hooks
+
+# Strict mode: fail if branch already exists
+worktree new feature-login --new
 ```
+
+> **Note:** `worktree new <branch>` auto-detects whether the branch exists. If it does, it checks out the existing branch into a new worktree. If it doesn't, it creates a fresh branch from the base. The `--new` flag enforces that the branch must not already exist.
 
 ### Remove Worktree
 
@@ -192,14 +194,14 @@ The tool automatically detects your terminal type and provides seamless integrat
 ### Usage
 
 ```bash
-# Use --terminal flag to enable panes/tabs
-worktree new feature-name --new --terminal
+# Terminal panes are the default
+worktree new feature-name
 ```
 
 ## Key Behaviors
 
-- **`--new` flag**: Strictly creates new worktrees; fails if branch/worktree already exists
-- **Without `--new`**: Switch to existing worktree if it exists
+- **Without `--new`**: Creates a new branch or checks out an existing one automatically
+- **With `--new`**: Strict mode — fails if the branch already exists
 - **Default base branch**: `main`
 - **Worktree naming**: `<project>-<branch-name>` (e.g., `sheets-agent-feature-login`)
 - **Worktree location**: Created as siblings to the source repo (e.g., `../sheets-agent-feature-name/`)
@@ -226,8 +228,8 @@ The tool respects the following environment variables:
 # 1. Initialize hooks
 worktree hooks init
 
-# 2. Create a new feature worktree with terminal panes
-worktree new feature-user-auth --new --terminal
+# 2. Create a new feature worktree
+worktree new feature-user-auth
 
 # 3. Work on the feature...
 
@@ -260,7 +262,7 @@ EOF
 chmod +x .worktree-hooks/post-create.d/60-setup
 
 # Create worktree (hooks run automatically)
-worktree new feature-test --new
+worktree new feature-test
 ```
 
 ## Troubleshooting
